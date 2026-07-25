@@ -2,6 +2,7 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "gemv-turbo.cuh"
 
 #include <cstdint>
 
@@ -1221,6 +1222,26 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    // batch-1 decode on the ternary/binary packs: re-tiled dp4a GEMV
+    // (gemv-turbo.cu); everything else takes the stock path below
+    if (!ids && !fusion && ncols_dst == 1 &&
+        (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_Q2_0)) {
+        bool handled = true;
+        for (int64_t i3 = 0; i3 < ne03 && handled; ++i3) {
+            for (int64_t i2 = 0; i2 < ne02 && handled; ++i2) {
+                const char * w_ptr = (const char *) src0->data + (i2*s02 + i3*s03)*ts_src0;
+                const block_q8_1 * a_ptr = (const block_q8_1 *) (src1_q8_1.get()) + (i2*s12 + i3*s13);
+                float * d_ptr = dst_d + i2*stride_channel_dst + i3*s3;
+                handled = ggml_cuda_gemv_turbo_try(
+                    w_ptr, src0->type, nb00, nb01,
+                    a_ptr, s11, d_ptr, ne00, ne01, ctx.device, stream);
+            }
+        }
+        if (handled) {
+            return;
+        }
+    }
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
