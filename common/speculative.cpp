@@ -1042,8 +1042,9 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             return true;
         }
 
-        // TODO: how to make it work with vision tokens? (mirrors draft-mtp)
-        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+        // vision batches carry embeddings instead of token ids; the staged
+        // rows only need positions + target capture rows, so accept them too
+        if (batch_in.token == nullptr && batch_in.embd == nullptr) {
             return true;
         }
 
@@ -1123,7 +1124,14 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
                 std::memcpy(feat.data() + (row0 + (size_t) i) * (size_t) n_embd_cap, cap,
                         (size_t) n_embd_cap * sizeof(float));
-                pos[row0 + i] = batch_in.pos[k];
+                // staged positions are draft-side bookkeeping only (draft()
+                // feeds the rows to ctx_dft at synthetic positions L+i); the
+                // draft is a text model, so always stage linear positions
+                // continuing the staged sequence -- vision rows may carry
+                // non-linear (mrope) positions in batch_in.pos
+                const llama_pos base = (row0 == 0) ? (llama_pos) n_cache[seq_id]
+                                                   : pos[row0 - 1] + 1;
+                pos[row0 + i] = base + i;
             }
 
             rows_since_accept[seq_id] += n_rows;
@@ -1161,8 +1169,15 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                         __func__, (int) seq_id, pos.size(), (long long) ctx_len);
                 continue;
             }
-            GGML_ASSERT(pos.front() == (int32_t) L        && "dspark: staged rows do not start at the drafter's cache position");
-            GGML_ASSERT(pos.back()  == (int32_t) start - 1 && "dspark: staged rows do not end just before the anchor position");
+            if (pos.front() != (int32_t) L || pos.back() != (int32_t) start - 1) {
+                // never let speculative decoding take the server down: skip the
+                // round and leave drafting disabled for this sequence instead
+                LOG_ERR("%s: seq %d staged rows out of sync (L=%lld start=%lld staged=%zu front=%d back=%d) -- disabling drafting for this seq\n",
+                        __func__, (int) seq_id, (long long) L, (long long) start,
+                        pos.size(), (int) pos.front(), (int) pos.back());
+                dp.drafting = false;
+                continue;
+            }
 
             const int64_t n_tokens = ctx_len + block_size;
             if (n_tokens > n_batch_max) {
